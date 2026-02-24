@@ -1,0 +1,13 @@
+services:
+  openai_gateway:
+    build: ./gateway
+    container_name: openai_gateway
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - gateway
+
+networks:
+  gateway:
+    driver: bridge
