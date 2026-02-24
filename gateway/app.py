@@ -56,7 +56,7 @@ async def proxy(path: str, request: Request):
             return StreamingResponse(
                 resp.aiter_bytes(),
                 status_code=resp.status_code,
-                headers=dict(resp.headers),
+                media_type=resp.headers.get("content-type"),
             )
 
     else:
@@ -70,5 +70,4 @@ async def proxy(path: str, request: Request):
         return Response(
             content=resp.content,
             status_code=resp.status_code,
-            headers=dict(resp.headers),
         )
