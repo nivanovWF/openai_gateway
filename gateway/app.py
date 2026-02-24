@@ -11,7 +11,7 @@ if not SOCKS5_PROXY:
     raise RuntimeError("SOCKS5_PROXY env variable not set")
 
 client = httpx.AsyncClient(
-    proxies=SOCKS5_PROXY,
+    proxy=SOCKS5_PROXY,
     timeout=60.0,
 )
 
