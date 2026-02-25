@@ -3,120 +3,108 @@ import os
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 import httpx
-import json
 
 app = FastAPI()
 
+# === ENV ===
 SOCKS5_PROXY = os.getenv("SOCKS5_PROXY")
 OPENAI_BASE = os.getenv("OPENAI_BASE", "https://api.openai.com")
 
 if not SOCKS5_PROXY:
     raise RuntimeError("SOCKS5_PROXY env variable not set")
 
+# === Logging ===
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gateway")
 
+# === HTTP Client ===
 client = httpx.AsyncClient(
     proxy=SOCKS5_PROXY,
     timeout=httpx.Timeout(
-        connect=10.0,
-        read=60.0,
-        write=10.0,
-        pool=5.0
+        connect=15.0,
+        read=300.0,
+        write=30.0,
+        pool=10.0
     ),
     limits=httpx.Limits(
-        max_connections=50,
-        max_keepalive_connections=20
-    )
+        max_connections=100,
+        max_keepalive_connections=50
+    ),
 )
 
-
-def normalize_openai_response(data: dict) -> dict:
-    """
-    Normalize OpenAI-style response into chat.completion format.
-    """
-
-    content = ""
-
-    # Handle modern response format
-    if "output" in data:
-        for item in data.get("output", []):
-            if item.get("type") == "message":
-                for block in item.get("content", []):
-                    if block.get("type") == "output_text":
-                        content += block.get("text", "")
-
-    # Handle classic chat completion format
-    elif "choices" in data:
-        choices = data.get("choices") or []
-
-        if len(choices) > 0:
-            msg = choices[0].get("message") or {}
-            content = msg.get("content") or ""
-
-    # Final normalized response
-    return {
-        "id": data.get("id", ""),
-        "object": "chat.completion",
-        "created": data.get("created", 0),
-        "model": data.get("model", ""),
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": content
-                },
-                "finish_reason": "stop"
-            }
-        ],
-        "usage": data.get("usage", {})
-    }
+# Hop-by-hop headers нельзя проксировать
+EXCLUDED_HEADERS = {
+    "content-encoding",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+}
 
 
-@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy(path: str, request: Request):
+
     url = f"{OPENAI_BASE}/v1/{path}"
+    logger.info(f"{request.method} {url}")
 
     body = await request.body()
 
+    # Копируем headers запроса
     headers = dict(request.headers)
     headers.pop("host", None)
     headers.pop("transfer-encoding", None)
 
+    # Определяем streaming
     is_stream = (
-        "stream" in str(request.query_params).lower()
+        "stream=true" in str(request.query_params).lower()
         or request.headers.get("accept") == "text/event-stream"
     )
 
-    logger.info(is_stream)
-    if is_stream:
-        async with client.stream(
-            request.method,
-            url,
-            content=body,
-            headers=headers,
-        ) as resp:
-            logger.info(resp.aiter_bytes())
-            return StreamingResponse(
-                resp.aiter_bytes(),
-                status_code=resp.status_code,
-                media_type=resp.headers.get("content-type"),
+    try:
+
+        # ================= STREAMING =================
+        if is_stream:
+            async with client.stream(
+                request.method,
+                url,
+                content=body,
+                headers=headers,
+            ) as resp:
+
+                response_headers = {
+                    k: v for k, v in resp.headers.items()
+                    if k.lower() not in EXCLUDED_HEADERS
+                }
+
+                return StreamingResponse(
+                    resp.aiter_raw(),
+                    status_code=resp.status_code,
+                    headers=response_headers,
+                )
+
+        # ================= NORMAL RESPONSE =================
+        else:
+            resp = await client.request(
+                request.method,
+                url,
+                content=body,
+                headers=headers,
             )
 
-    else:
-        resp = await client.request(
-            request.method,
-            url,
-            content=body,
-            headers=headers,
-        )
-        raw_data = resp.json()
+            response_headers = {
+                k: v for k, v in resp.headers.items()
+                if k.lower() not in EXCLUDED_HEADERS
+            }
 
-        safe_data = normalize_openai_response(raw_data)
-        logger.info(safe_data)
+            return Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                headers=response_headers,
+            )
+
+    except httpx.RequestError as e:
+        logger.error(f"Upstream request error: {e}")
         return Response(
-            content=json.dumps(safe_data),
-            media_type="application/json",
-            status_code=resp.status_code,
+            content=str(e),
+            status_code=502,
         )
